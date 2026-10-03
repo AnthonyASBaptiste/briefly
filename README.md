@@ -58,12 +58,15 @@ Inference uses the local Ollama service at `127.0.0.1`; document text is not sen
 Briefly was built for the **DEV Hacktoberfest 2026 Challenge ("Build for a Friend")**.
 
 ### The Problem
+
 My wife is a practicing attorney. Like many busy professionals, she downloads client files, court orders, disclosure documents, and billing receipts directly into her Downloads folder—intending to file them later. Over time, that folder turns into an unmanageable digital junk drawer where finding a critical filing means searching through hundreds of ambiguously named PDFs like `document (12).pdf`.
 
 ### Why Open-Source AI Matters
+
 In the legal profession, attorney-client privilege and confidentiality are non-negotiable. Sending client documents, court pleadings, and sensitive financial data across third-party proprietary AI APIs creates serious ethical, compliance, and privacy risks.
 
 Open-source, open-weight AI fundamentally changes this:
+
 - **Zero data egress**: Using Google's open-weight **Gemma 4** (`gemma4:e2b-it-qat`) running locally via **Ollama**, all document understanding occurs strictly on the attorney's machine (`127.0.0.1`). No cloud endpoints, no telemetry, and no account required.
 - **Auditable & constrained**: Strictly constrained JSON schema output guarantees the model only selects from verified, user-approved matter folders.
 - **Human-in-the-loop**: The AI suggests; the attorney approves. Low-confidence files remain untouched in the inbox and surface in a transparent review queue.

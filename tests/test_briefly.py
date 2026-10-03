@@ -166,6 +166,33 @@ class TestBriefly(unittest.TestCase):
             self.assertEqual(len(files), 1)
             self.assertEqual(files[0].read_text(), "New incoming copy")
 
+    def test_cooldown_prevents_premature_move(self):
+        (self.matters / "Alpha v Beta" / "Orders").mkdir(parents=True)
+        test_file = self.inbox / "order.txt"
+        test_file.write_text("Immediate filing attempt")
+        briefly.SETTINGS["cooldown_seconds"] = 120
+
+        with patch("briefly.classify") as mock_classify:
+            mock_classify.return_value = {
+                "matter": "Alpha v Beta",
+                "document_type": "Orders",
+                "confidence": 0.95,
+                "reason": "Matched"
+            }
+            # 1. Under cooldown -> returns None, not processed or moved
+            res = briefly.process_file(test_file, bypass_cooldown=False)
+            self.assertIsNone(res)
+            self.assertTrue(test_file.exists())
+            self.assertEqual(mock_classify.call_count, 0)
+
+            # 2. File mtime aged past cooldown -> successfully filed
+            os.utime(test_file, (time.time() - 130, time.time() - 130))
+            res = briefly.process_file(test_file, bypass_cooldown=False)
+            self.assertEqual(res["status"], "filed")
+            self.assertFalse(test_file.exists())
+            self.assertTrue((self.matters / "Alpha v Beta" / "Orders" / "order.txt").exists())
+            self.assertEqual(mock_classify.call_count, 1)
+
     def test_is_local_url(self):
         self.assertTrue(briefly.is_local_url("http://127.0.0.1:11434"))
         self.assertTrue(briefly.is_local_url("http://localhost:11434"))

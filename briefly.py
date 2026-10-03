@@ -309,13 +309,18 @@ def scan(bypass_cooldown=False):
 
 
 def discover_matters():
-    """Suggest matter folder names without moving or creating anything."""
+    """Suggest matter folder names using collective multi-document reasoning across the inbox."""
     inbox = safe_path(SETTINGS["inbox"])
     inbox.mkdir(parents=True, exist_ok=True)
     allowed = {x.lower() if x.startswith(".") else "." + x.lower() for x in SETTINGS["extensions"]}
     excluded = {x.lower() if x.startswith(".") else "." + x.lower() for x in SETTINGS["excluded_extensions"]}
-    existing_keys = {canonical_matter_key(m) for m in matter_folders()}
-    suggestions, skipped_cooldown = [], []
+    existing = matter_folders()
+    existing_keys = {canonical_matter_key(m): m for m in existing}
+
+    candidates = []
+    skipped_cooldown = []
+    unreadable = []
+
     with LOCK:
         for path in sorted(inbox.iterdir()):
             if not path.is_file() or path.suffix.lower() not in allowed or path.suffix.lower() in excluded:
@@ -325,7 +330,7 @@ def discover_matters():
                 if time.time() - path.stat().st_mtime < int(SETTINGS["cooldown_seconds"]):
                     skipped_cooldown.append(path.name)
                     continue
-                time.sleep(.15)
+                time.sleep(.05)
                 if path.stat().st_size != size:
                     skipped_cooldown.append(path.name)
                     continue
@@ -333,14 +338,125 @@ def discover_matters():
                 continue
             try:
                 text = extract_text(path)
-                result = classify(path, text, allow_unlisted=True)
-                if result.get("matter") and canonical_matter_key(result["matter"]) in existing_keys:
-                    result["already_exists"] = True
-                suggestions.append({"filename": path.name, "source": str(path), **result})
+                words = text.split()[:70]
+                snippet = " ".join(words)
+                candidates.append({"id": len(candidates) + 1, "filename": path.name, "source": str(path), "excerpt": snippet})
             except Exception as e:
-                suggestions.append({"filename": path.name, "source": str(path), "matter": None,
-                                   "document_type": "Other", "confidence": 0, "reason": str(e)[:300]})
-    return {"suggestions": suggestions, "skipped_cooldown": skipped_cooldown}
+                unreadable.append({"filename": path.name, "reason": str(e)[:300]})
+
+    if not candidates:
+        return {"suggestions": [], "unrelated_files": [], "skipped_cooldown": skipped_cooldown, "unreadable": unreadable}
+
+    # Global Multi-Document Synthesis Prompt
+    doc_index = [{"id": c["id"], "filename": c["filename"], "excerpt": c["excerpt"]} for c in candidates]
+    prompt = f"""You are Briefly, an expert legal clerk assistant.
+Below is a numbered list of unfiled legal documents in the office inbox.
+Analyze all documents TOGETHER to discover the distinct legal matters. Group every document by its document ID.
+
+CRITICAL RULES:
+1. Multiple documents often belong to the SAME case (e.g. pleadings, retainer agreements, medical reports, hospital discharge summaries, police accident reports, settlement proposals, and sick leave certificates for the same injured client or accident belong to that ONE litigation case).
+2. For litigation/court claims, format the matter folder strictly as "Plaintiff v Defendant" (e.g. "Marcus Sterling v Kevin Gopaul & Colfire" or "Apex Logistics v TrinHaulage Ltd"). Do NOT include claim numbers, damage descriptions, or phrases like "Personal Injury Claim" in the folder name.
+3. For probate or estate matters, format strictly as "Estate of [Deceased Name]" (e.g. "Estate of Helena Blackwood").
+4. If a document is personal or unrelated office expense (e.g. office supplies receipt), place its document ID in "unrelated_doc_ids".
+
+Existing matter folders in library: {json.dumps(existing)}
+
+Documents:
+{json.dumps(doc_index, indent=2)}
+
+Return JSON matching:
+{{
+  "matters": [
+    {{
+      "matter_name": "Standardized Concise Case Name",
+      "doc_ids": [1, 2, 3],
+      "confidence": 0.95,
+      "reason": "Brief explanation of why these belong together"
+    }}
+  ],
+  "unrelated_doc_ids": [4, 5]
+}}
+"""
+    body = json.dumps({
+        "model": SETTINGS["model"],
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.1, "num_ctx": 8192, "num_predict": 1024},
+        "format": "json"
+    }).encode()
+
+    req = urllib.request.Request(SETTINGS["ollama_url"].rstrip("/") + "/api/generate", data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+        raw_answer = result.get("response", "{}")
+        parsed = json.loads(raw_answer) if isinstance(raw_answer, str) else raw_answer
+        if not isinstance(parsed, dict):
+            raise ValueError("Expected JSON object from model")
+    except Exception as e:
+        raise RuntimeError(f"Could not synthesize matter suggestions: {e}")
+
+    raw_matters = parsed.get("matters", [])
+    if not isinstance(raw_matters, list):
+        raw_matters = []
+
+    id_to_candidate = {c["id"]: c for c in candidates}
+    all_assigned_ids = set()
+    suggestions = []
+
+    for item in raw_matters:
+        if not isinstance(item, dict):
+            continue
+        raw_name = str(item.get("matter_name", "")).strip()
+        raw_name = re.sub(r"[/\\]+", " ", raw_name)
+        raw_name = re.sub(r"[^\w &(),.\'-]", "", raw_name).strip(" .")[:100]
+        if not raw_name or raw_name.lower() in ("null", "none", "uncategorized", "uncategorized office expenses"):
+            continue
+
+        doc_ids = item.get("doc_ids", [])
+        if not isinstance(doc_ids, list):
+            doc_ids = []
+        valid_files = [id_to_candidate[did]["filename"] for did in doc_ids if did in id_to_candidate]
+        if not valid_files:
+            continue
+
+        ckey = canonical_matter_key(raw_name)
+        already_exists = False
+        final_name = raw_name
+        if ckey in existing_keys:
+            already_exists = True
+            final_name = existing_keys[ckey]
+
+        conf = float(item.get("confidence", 0.9))
+        conf = max(0.0, min(1.0, conf))
+        reason = str(item.get("reason", ""))[:300]
+
+        suggestions.append({
+            "name": final_name,
+            "matter": final_name,
+            "files": valid_files,
+            "confidence": conf,
+            "reason": reason,
+            "already_exists": already_exists
+        })
+        all_assigned_ids.update(did for did in doc_ids if did in id_to_candidate)
+
+    unrelated_ids = parsed.get("unrelated_doc_ids", [])
+    if not isinstance(unrelated_ids, list):
+        unrelated_ids = []
+
+    unrelated_files = [id_to_candidate[did]["filename"] for did in unrelated_ids if did in id_to_candidate]
+    for c in candidates:
+        if c["id"] not in all_assigned_ids and c["filename"] not in unrelated_files:
+            unrelated_files.append(c["filename"])
+
+    return {
+        "suggestions": suggestions,
+        "unrelated_files": unrelated_files,
+        "skipped_cooldown": skipped_cooldown,
+        "unreadable": unreadable
+    }
 
 
 def pick_folder(initial=""):
@@ -455,6 +571,15 @@ def init_demo():
     library = safe_path(SETTINGS["library"])
     inbox.mkdir(parents=True, exist_ok=True)
     library.mkdir(parents=True, exist_ok=True)
+    try:
+        if str(APP) not in sys.path:
+            sys.path.insert(0, str(APP))
+        from scripts.generate_demo_files import generate_all_files, seed_matters
+        seed_matters(library)
+        generate_all_files(inbox)
+        return
+    except Exception:
+        pass
     (library / "Garcia v Northstar Ltd").mkdir(exist_ok=True)
     (library / "Ramdial Estate").mkdir(exist_ok=True)
     samples = {
@@ -594,7 +719,16 @@ if __name__ == "__main__":
     if os.environ.get("BRIEFLY_NO_BROWSER") != "1" and "--no-browser" not in sys.argv:
         threading.Thread(target=open_browser, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
-    print("Briefly is running at http://127.0.0.1:8765 (local only)")
+    print("=" * 60)
+    print("Briefly — Local-first legal filing assistant")
+    print(f"Web UI:      http://127.0.0.1:8765")
+    print(f"Inbox:       {safe_path(SETTINGS['inbox'])}")
+    print(f"Library:     {safe_path(SETTINGS['library'])}")
+    print(f"Ollama:      {SETTINGS['ollama_url']} (model: {SETTINGS['model']})")
+    print("=" * 60)
+    print("Tip: Use the 'Configure folders…' button in the web UI to point")
+    print("     Briefly at your real inbox or document library anytime.")
+    print("=" * 60)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

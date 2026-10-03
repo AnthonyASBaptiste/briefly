@@ -341,18 +341,76 @@ class TestBriefly(unittest.TestCase):
     def test_discover_matters_with_files(self):
         doc = self.inbox / "contract.txt"
         doc.write_text("Agreement between Acme Corp and Beta LLC.")
-        mock_result = {
-            "matter": "Acme Corp Merger",
-            "document_type": "Agreement",
-            "confidence": 0.92,
-            "reason": "Strong evidence of merger agreement"
+        mock_response = {
+            "response": json.dumps({
+                "matters": [
+                    {
+                        "matter_name": "Acme Corp v Beta LLC",
+                        "doc_ids": [1],
+                        "confidence": 0.92,
+                        "reason": "Strong evidence of dispute between Acme Corp and Beta LLC"
+                    }
+                ],
+                "unrelated_doc_ids": []
+            })
         }
-        with patch("briefly.classify", return_value=mock_result):
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_cm = MagicMock()
+            mock_cm.__enter__.return_value.read.return_value = json.dumps(mock_response).encode()
+            mock_url.return_value = mock_cm
+
             res = briefly.discover_matters()
             self.assertEqual(len(res["suggestions"]), 1)
-            self.assertEqual(res["suggestions"][0]["matter"], "Acme Corp Merger")
-            self.assertEqual(res["suggestions"][0]["filename"], "contract.txt")
+            self.assertEqual(res["suggestions"][0]["matter"], "Acme Corp v Beta LLC")
+            self.assertEqual(res["suggestions"][0]["files"], ["contract.txt"])
             self.assertEqual(res["suggestions"][0]["confidence"], 0.92)
+            self.assertFalse(res["suggestions"][0]["already_exists"])
+
+    def test_discover_matters_matches_existing_library_matter(self):
+        (self.matters / "Acme Corp v Beta LLC").mkdir()
+        doc = self.inbox / "motion.txt"
+        doc.write_text("Notice of Motion in Acme Corp v Beta LLC.")
+        mock_response = {
+            "response": json.dumps({
+                "matters": [
+                    {
+                        "matter_name": "Acme Corp vs. Beta LLC",
+                        "doc_ids": [1],
+                        "confidence": 0.95,
+                        "reason": "Explicit reference to Acme Corp vs. Beta LLC"
+                    }
+                ],
+                "unrelated_doc_ids": []
+            })
+        }
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_cm = MagicMock()
+            mock_cm.__enter__.return_value.read.return_value = json.dumps(mock_response).encode()
+            mock_url.return_value = mock_cm
+
+            res = briefly.discover_matters()
+            self.assertEqual(len(res["suggestions"]), 1)
+            # Reconciled canonical title matching existing library folder
+            self.assertEqual(res["suggestions"][0]["matter"], "Acme Corp v Beta LLC")
+            self.assertTrue(res["suggestions"][0]["already_exists"])
+
+    def test_discover_matters_unrelated_files(self):
+        receipt = self.inbox / "receipt.txt"
+        receipt.write_text("Staples receipt for paper and ink.")
+        mock_response = {
+            "response": json.dumps({
+                "matters": [],
+                "unrelated_doc_ids": [1]
+            })
+        }
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_cm = MagicMock()
+            mock_cm.__enter__.return_value.read.return_value = json.dumps(mock_response).encode()
+            mock_url.return_value = mock_cm
+
+            res = briefly.discover_matters()
+            self.assertEqual(len(res["suggestions"]), 0)
+            self.assertIn("receipt.txt", res["unrelated_files"])
 
     def test_api_discover(self):
         server = briefly.ThreadingHTTPServer(("127.0.0.1", 0), briefly.Handler)
@@ -475,6 +533,13 @@ class TestBriefly(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             briefly.extract_text(test_zip)
         self.assertIn("Archive bundle (.zip)", str(ctx.exception))
+
+    def test_init_demo(self):
+        briefly.init_demo()
+        inbox_files = list(self.inbox.iterdir())
+        self.assertGreater(len(inbox_files), 0)
+        matter_folders = list(self.matters.iterdir())
+        self.assertGreater(len(matter_folders), 0)
 
 
 if __name__ == "__main__":

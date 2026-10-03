@@ -4,7 +4,10 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -17,11 +20,14 @@ class TestBriefly(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.inbox = Path(self.test_dir) / "inbox"
         self.matters = Path(self.test_dir) / "matters"
+        self.unrelated = Path(self.test_dir) / "unrelated"
         self.inbox.mkdir(parents=True)
         self.matters.mkdir(parents=True)
+        self.unrelated.mkdir(parents=True)
         self.original_settings = dict(briefly.SETTINGS)
         briefly.SETTINGS["inbox"] = str(self.inbox)
         briefly.SETTINGS["library"] = str(self.matters)
+        briefly.SETTINGS["unrelated_folder"] = str(self.unrelated)
 
     def tearDown(self):
         briefly.SETTINGS.clear()
@@ -203,6 +209,128 @@ class TestBriefly(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 briefly.classify(test_file, "Some text")
             self.assertIn("unreadable result", str(ctx.exception))
+
+    def test_pick_folder_subprocess(self):
+        # 1. Successful selection via subprocess (e.g. zenity)
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "/custom/path/chosen\n"
+        with patch("shutil.which", side_effect=lambda cmd: "/usr/bin/zenity" if cmd == "zenity" else None):
+            with patch("subprocess.run", return_value=mock_proc):
+                self.assertEqual(briefly.pick_folder(), "/custom/path/chosen")
+
+        # 2. Cancelled selection via subprocess (returncode 1)
+        mock_cancel = MagicMock()
+        mock_cancel.returncode = 1
+        mock_cancel.stdout = ""
+        with patch("shutil.which", side_effect=lambda cmd: "/usr/bin/zenity" if cmd == "zenity" else None):
+            with patch("subprocess.run", return_value=mock_cancel):
+                self.assertEqual(briefly.pick_folder(), "")
+
+    def test_api_exclude_success(self):
+        server = briefly.ThreadingHTTPServer(("127.0.0.1", 0), briefly.Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            # Create a receipt file in the inbox
+            test_file = self.inbox / "receipt_123.txt"
+            test_file.write_text("Office chair receipt $129.00")
+
+            req_body = json.dumps({"source": str(test_file)}).encode()
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/exclude", data=req_body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read())
+                self.assertTrue(data.get("ok"))
+
+            # File is removed from inbox and placed into unrelated folder
+            self.assertFalse(test_file.exists())
+            dest_file = self.unrelated / "receipt_123.txt"
+            self.assertTrue(dest_file.exists())
+            self.assertEqual(dest_file.read_text(), "Office chair receipt $129.00")
+
+            # Check audit event
+            with briefly.db() as con:
+                rows = [dict(r) for r in con.execute("SELECT * FROM activity WHERE filename='receipt_123.txt'")]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["status"], "excluded")
+                self.assertIn("Moved out of inbox", rows[0]["reason"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_api_exclude_collision(self):
+        server = briefly.ThreadingHTTPServer(("127.0.0.1", 0), briefly.Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            # Pre-existing file in unrelated folder
+            existing = self.unrelated / "ticket.txt"
+            existing.write_text("Original ticket copy")
+
+            # Incoming file with same name in inbox
+            incoming = self.inbox / "ticket.txt"
+            incoming.write_text("New ticket copy")
+
+            req_body = json.dumps({"source": str(incoming)}).encode()
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/exclude", data=req_body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+
+            # Original file untouched
+            self.assertEqual(existing.read_text(), "Original ticket copy")
+            # New file moved with unique timestamp suffix
+            collision_copies = list(self.unrelated.glob("ticket (*).txt"))
+            self.assertEqual(len(collision_copies), 1)
+            self.assertEqual(collision_copies[0].read_text(), "New ticket copy")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_api_exclude_outside_inbox_rejected(self):
+        server = briefly.ThreadingHTTPServer(("127.0.0.1", 0), briefly.Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            # File outside inbox
+            outside = Path(self.test_dir) / "outside.txt"
+            outside.write_text("Secret outside file")
+
+            req_body = json.dumps({"source": str(outside)}).encode()
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/exclude", data=req_body,
+                                         headers={"Content-Type": "application/json"})
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 400)
+            ctx.exception.close()
+            self.assertTrue(outside.exists())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_api_settings_unrelated_folder(self):
+        server = briefly.ThreadingHTTPServer(("127.0.0.1", 0), briefly.Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            new_unrelated = Path(self.test_dir) / "custom_unrelated"
+            req_body = json.dumps({"unrelated_folder": str(new_unrelated)}).encode()
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/settings", data=req_body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read())
+                self.assertEqual(data["state"]["settings"]["unrelated_folder"], str(new_unrelated))
+            self.assertTrue(new_unrelated.exists())
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

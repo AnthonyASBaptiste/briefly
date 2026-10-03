@@ -2,6 +2,7 @@
 """Briefly: local-first legal document filing assistant (stdlib-only MVP)."""
 from __future__ import annotations
 
+import contextlib
 import json
 import mimetypes
 import os
@@ -26,6 +27,7 @@ APP = Path(__file__).resolve().parent
 WORK = APP / "workspace"
 DEFAULTS = {
     "inbox": str(WORK / "inbox"), "library": str(WORK / "matters"),
+    "unrelated_folder": str(Path.home() / "Documents"),
     "cooldown_seconds": 0, "extensions": [".pdf", ".docx", ".txt", ".md"],
     "excluded_extensions": [".zip", ".exe", ".jpg", ".jpeg", ".png"],
     "confidence_threshold": 0.82, "watch_enabled": False,
@@ -67,8 +69,8 @@ SETTINGS = load_settings()
 
 
 def ensure_workspace_settings():
-    """Ensure inbox and library paths are configured and valid."""
-    for key, default in (("inbox", WORK / "inbox"), ("library", WORK / "matters")):
+    """Ensure inbox, library, and unrelated_folder paths are configured and valid."""
+    for key, default in (("inbox", WORK / "inbox"), ("library", WORK / "matters"), ("unrelated_folder", Path.home() / "Documents")):
         value = str(SETTINGS.get(key, "")).strip()
         if not value:
             SETTINGS[key] = str(default.resolve())
@@ -83,16 +85,20 @@ def save_settings():
 ensure_workspace_settings()
 
 
+@contextlib.contextmanager
 def db():
     DB.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB, timeout=10)
     con.row_factory = sqlite3.Row
-    con.execute("""CREATE TABLE IF NOT EXISTS activity (
-      id INTEGER PRIMARY KEY, created_at TEXT, filename TEXT, source TEXT,
-      destination TEXT, status TEXT, doc_type TEXT, matter TEXT,
-      confidence REAL, reason TEXT)""")
-    con.commit()
-    return con
+    try:
+        with con:
+            con.execute("""CREATE TABLE IF NOT EXISTS activity (
+              id INTEGER PRIMARY KEY, created_at TEXT, filename TEXT, source TEXT,
+              destination TEXT, status TEXT, doc_type TEXT, matter TEXT,
+              confidence REAL, reason TEXT)""")
+        yield con
+    finally:
+        con.close()
 
 
 def log_activity(filename, source, destination, status, doc_type="", matter="", confidence=0, reason=""):
@@ -291,19 +297,69 @@ def discover_matters():
 
 
 def pick_folder(initial=""):
-    """Use the OS directory chooser so the server receives an absolute local path."""
+    """Use the OS directory chooser via isolated subprocess so the server never crashes."""
+    initial_path = str(Path(initial).expanduser().resolve()) if initial and Path(initial).exists() else str(Path.home())
+
+    # 1. macOS osascript (native Cocoa Finder folder picker)
+    if shutil.which("osascript"):
+        script = f'POSIX path of (choose folder with prompt "Choose a local folder" default location POSIX file "{initial_path}")'
+        try:
+            res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=120)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+            elif res.returncode == 1:
+                return ""  # User cancelled
+        except Exception:
+            pass
+
+    # 2. Linux zenity (native GTK dialog)
+    if shutil.which("zenity"):
+        cmd = ["zenity", "--file-selection", "--directory", "--title=Choose a local folder", f"--filename={initial_path}/"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+            elif res.returncode == 1:
+                return ""  # User cancelled
+        except Exception:
+            pass
+
+    # 3. Linux kdialog (native Qt dialog)
+    if shutil.which("kdialog"):
+        cmd = ["kdialog", "--getexistingdirectory", initial_path, "--title", "Choose a local folder"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+            elif res.returncode == 1:
+                return ""  # User cancelled
+        except Exception:
+            pass
+
+    # 4. Isolated Python child process with Tkinter (isolated so a crash cannot kill the server)
+    code = f"""
+import sys
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    path = filedialog.askdirectory(initialdir={repr(initial_path)}, title="Choose a local folder", mustexist=False)
+    root.destroy()
+    if path:
+        print(path)
+except Exception:
+    sys.exit(1)
+"""
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        selected = filedialog.askdirectory(initialdir=initial if Path(initial).is_dir() else str(Path.home()),
-                                           title="Choose a local folder", mustexist=False)
-        root.destroy()
-        return selected
-    except Exception as e:
-        raise RuntimeError(f"Could not open the system folder picker: {e}") from e
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+
+    return ""
 
 
 def create_matter_folder(proposed):
@@ -365,7 +421,8 @@ def init_workspace():
     """Create the user's chosen roots without inventing matters or adding sample files."""
     safe_path(SETTINGS["inbox"]).mkdir(parents=True, exist_ok=True)
     safe_path(SETTINGS["library"]).mkdir(parents=True, exist_ok=True)
-    db()
+    with db():
+        pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -399,6 +456,7 @@ class Handler(BaseHTTPRequestHandler):
                     proposed = {**SETTINGS, **data}
                     proposed["inbox"] = str(safe_path(proposed["inbox"]))
                     proposed["library"] = str(safe_path(proposed["library"]))
+                    proposed["unrelated_folder"] = str(safe_path(proposed.get("unrelated_folder", str(Path.home() / "Documents"))))
                     proposed["cooldown_seconds"] = max(0, min(86400, int(proposed["cooldown_seconds"])))
                     proposed["watch_interval_seconds"] = max(5, min(3600, int(proposed["watch_interval_seconds"])))
                     proposed["confidence_threshold"] = max(0.0, min(1.0, float(proposed["confidence_threshold"])))
@@ -410,11 +468,13 @@ class Handler(BaseHTTPRequestHandler):
                     proposed["model"] = str(proposed["model"])[:100]
                     Path(proposed["inbox"]).mkdir(parents=True, exist_ok=True)
                     Path(proposed["library"]).mkdir(parents=True, exist_ok=True)
+                    Path(proposed["unrelated_folder"]).mkdir(parents=True, exist_ok=True)
                     SETTINGS = proposed; save_settings()
                 self.send_json({"ok": True, "state": dashboard_data()})
             elif route == "/api/pick-folder":
-                kind = "inbox" if data.get("kind") == "inbox" else "library"
-                self.send_json({"path": pick_folder(SETTINGS[kind])})
+                kind = data.get("kind", "")
+                initial_val = SETTINGS.get(kind, str(Path.home()))
+                self.send_json({"path": pick_folder(initial_val)})
             elif route == "/api/discover":
                 self.send_json(discover_matters())
             elif route == "/api/create-matter":
@@ -438,6 +498,19 @@ class Handler(BaseHTTPRequestHandler):
                     dest = unique_destination(destination_dir, source.name)
                     shutil.move(str(source), str(dest))
                     log_activity(source.name, source, dest, "filed_by_user", dtype, matter_name, 1.0, "Filed from review queue")
+                    self.send_json({"ok": True, "state": dashboard_data()})
+            elif route == "/api/exclude":
+                with LOCK:
+                    inbox = safe_path(SETTINGS["inbox"])
+                    source = safe_path(data.get("source", ""))
+                    source.relative_to(inbox)
+                    if not source.is_file():
+                        raise ValueError("The file is no longer in the inbox")
+                    unrelated_dir = safe_path(SETTINGS.get("unrelated_folder", str(Path.home() / "Documents")))
+                    unrelated_dir.mkdir(parents=True, exist_ok=True)
+                    dest = unique_destination(unrelated_dir, source.name)
+                    shutil.move(str(source), str(dest))
+                    log_activity(source.name, source, dest, "excluded", "Unrelated", "", 1.0, "Moved out of inbox to Documents")
                     self.send_json({"ok": True, "state": dashboard_data()})
             else:
                 self.send_json({"error": "Not found"}, 404)

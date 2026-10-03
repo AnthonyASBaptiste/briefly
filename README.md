@@ -18,7 +18,7 @@
 
 ## Run it
 
-Requirements: Python 3.10+ and (for AI filing) [Ollama](https://ollama.com/) with `gemma4:e2b-it-qat` pulled locally. Briefly defaults to this compact Gemma 4 E2B build and limits inference context to 4,096 tokens to keep memory use modest. You can choose another installed model in Settings.
+Requirements: Python 3.10+ and (for AI filing) [Ollama](https://ollama.com/) with `gemma4:e2b-it-qat` pulled locally. Briefly defaults to this compact Gemma 4 E2B build and limits inference context to 4,096 tokens to keep memory use modest. This was done because of the tight memory constraints of my target's laptop. You can choose another installed model in Settings.
 
 ```bash
 ollama pull gemma4:e2b-it-qat

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+briefly.sqlite3
+workspace/
+.DS_Store
+.agents/
+.aws/
+.codex/
+.env

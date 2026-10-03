@@ -37,6 +37,14 @@ CONFIG = APP / "workspace" / "settings.json"
 DB = APP / "workspace" / "briefly.sqlite3"
 
 
+def is_local_url(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url).strip())
+        return parsed.scheme in ("http", "https") and parsed.hostname in ("127.0.0.1", "localhost")
+    except Exception:
+        return False
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -46,7 +54,10 @@ def load_settings():
     if CONFIG.exists():
         try:
             saved = json.loads(CONFIG.read_text())
-            return {**DEFAULTS, **saved}
+            merged = {**DEFAULTS, **saved}
+            if not is_local_url(merged.get("ollama_url", "")):
+                merged["ollama_url"] = DEFAULTS["ollama_url"]
+            return merged
         except (ValueError, OSError):
             pass
     return dict(DEFAULTS)
@@ -93,6 +104,21 @@ def log_activity(filename, source, destination, status, doc_type="", matter="", 
 def safe_path(raw: str) -> Path:
     p = Path(os.path.expanduser(raw)).resolve()
     return p
+
+
+def unique_destination(directory: Path, filename: str) -> Path:
+    dest = directory / filename
+    if not dest.exists():
+        return dest
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    candidate = directory / f"{stem} ({ts}){suffix}"
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{stem} ({ts}_{counter}){suffix}"
+        counter += 1
+    return candidate
 
 
 def matter_folders():
@@ -150,10 +176,13 @@ Filename: {path.name}\nDocument excerpt:\n{text[:12000]}'''
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
             result = json.loads(resp.read())
-        answer = json.loads(result.get("response", "{}"))
+        raw_answer = result.get("response", "{}")
+        answer = json.loads(raw_answer) if isinstance(raw_answer, str) else raw_answer
+        if not isinstance(answer, dict):
+            raise ValueError("Expected JSON object from model")
     except urllib.error.URLError as e:
         raise RuntimeError("Cannot reach local Ollama. Start Ollama and confirm the selected model is installed.") from e
-    except (ValueError, KeyError) as e:
+    except (ValueError, KeyError, AttributeError, TypeError) as e:
         raise RuntimeError("The model returned an unreadable result; file left untouched") from e
     matter = answer.get("matter")
     if str(matter).strip().lower() in ("null", "none", ""):
@@ -202,9 +231,7 @@ def process_file(path: Path, bypass_cooldown=False):
             destination_dir = (matter / result["document_type"]).resolve()
             destination_dir.relative_to(matter)
             destination_dir.mkdir(exist_ok=True)
-            dest = destination_dir / path.name
-            if dest.exists():
-                dest = destination_dir / f"{path.stem} ({datetime.now().strftime('%Y%m%d-%H%M%S')}){path.suffix}"
+            dest = unique_destination(destination_dir, path.name)
             shutil.move(str(path), str(dest))
             log_activity(path.name, path, dest, "filed", result["document_type"], result["matter"], result["confidence"], result["reason"])
             return {"status": "filed", "filename": path.name, "destination": str(dest), **result}
@@ -378,8 +405,8 @@ class Handler(BaseHTTPRequestHandler):
                     for key in ("extensions", "excluded_extensions"):
                         if not isinstance(proposed[key], list): raise ValueError(f"{key} must be a list")
                         proposed[key] = sorted(set(str(x).lower() if str(x).startswith(".") else "." + str(x).lower() for x in proposed[key]))
-                    if not str(proposed["ollama_url"]).startswith("http://127.0.0.1") and not str(proposed["ollama_url"]).startswith("http://localhost"):
-                        raise ValueError("For privacy, Ollama URL must point to this computer (localhost)")
+                    if not is_local_url(proposed["ollama_url"]):
+                        raise ValueError("For privacy, Ollama URL must point to this computer (127.0.0.1 or localhost)")
                     proposed["model"] = str(proposed["model"])[:100]
                     Path(proposed["inbox"]).mkdir(parents=True, exist_ok=True)
                     Path(proposed["library"]).mkdir(parents=True, exist_ok=True)
@@ -398,20 +425,20 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/demo":
                 init_demo(); self.send_json({"ok": True, "state": dashboard_data()})
             elif route == "/api/approve":
-                inbox = safe_path(SETTINGS["inbox"]); root = safe_path(SETTINGS["library"])
-                source = safe_path(data.get("source", "")); source.relative_to(inbox)
-                matter_name = str(data.get("matter", ""))
-                if matter_name not in matter_folders(): raise ValueError("Choose an existing matter")
-                dtype = re.sub(r"[^\w -]", "", str(data.get("document_type", "Other"))).strip()[:48] or "Other"
-                matter = (root / matter_name).resolve(); matter.relative_to(root)
-                destination_dir = (matter / dtype).resolve(); destination_dir.relative_to(matter)
-                if not source.is_file(): raise ValueError("The file is no longer in the inbox")
-                destination_dir.mkdir(exist_ok=True)
-                dest = destination_dir / source.name
-                if dest.exists(): dest = destination_dir / f"{source.stem} ({datetime.now().strftime('%Y%m%d-%H%M%S')}){source.suffix}"
-                shutil.move(str(source), str(dest))
-                log_activity(source.name, source, dest, "filed_by_user", dtype, matter_name, 1.0, "Filed from review queue")
-                self.send_json({"ok": True, "state": dashboard_data()})
+                with LOCK:
+                    inbox = safe_path(SETTINGS["inbox"]); root = safe_path(SETTINGS["library"])
+                    source = safe_path(data.get("source", "")); source.relative_to(inbox)
+                    matter_name = str(data.get("matter", ""))
+                    if matter_name not in matter_folders(): raise ValueError("Choose an existing matter")
+                    dtype = re.sub(r"[^\w -]", "", str(data.get("document_type", "Other"))).strip()[:48] or "Other"
+                    matter = (root / matter_name).resolve(); matter.relative_to(root)
+                    destination_dir = (matter / dtype).resolve(); destination_dir.relative_to(matter)
+                    if not source.is_file(): raise ValueError("The file is no longer in the inbox")
+                    destination_dir.mkdir(exist_ok=True)
+                    dest = unique_destination(destination_dir, source.name)
+                    shutil.move(str(source), str(dest))
+                    log_activity(source.name, source, dest, "filed_by_user", dtype, matter_name, 1.0, "Filed from review queue")
+                    self.send_json({"ok": True, "state": dashboard_data()})
             else:
                 self.send_json({"error": "Not found"}, 404)
         except Exception as e:
@@ -422,7 +449,10 @@ def watcher():
     while True:
         time.sleep(max(5, int(SETTINGS["watch_interval_seconds"])))
         if SETTINGS["watch_enabled"]:
-            scan()
+            try:
+                scan()
+            except Exception:
+                pass
 
 
 def open_browser():

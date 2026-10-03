@@ -153,6 +153,57 @@ class TestBriefly(unittest.TestCase):
             self.assertEqual(len(files), 1)
             self.assertEqual(files[0].read_text(), "New incoming copy")
 
+    def test_is_local_url(self):
+        self.assertTrue(briefly.is_local_url("http://127.0.0.1:11434"))
+        self.assertTrue(briefly.is_local_url("http://localhost:11434"))
+        self.assertTrue(briefly.is_local_url("https://127.0.0.1:8765/api"))
+        # Security test: reject attacker domains starting with 127.0.0.1 or localhost
+        self.assertFalse(briefly.is_local_url("http://127.0.0.1.attacker.com"))
+        self.assertFalse(briefly.is_local_url("http://localhost.evil.com"))
+        self.assertFalse(briefly.is_local_url("http://example.com"))
+        self.assertFalse(briefly.is_local_url("file:///etc/passwd"))
+        self.assertFalse(briefly.is_local_url("not a url"))
+
+    def test_unique_destination_multiple_collisions(self):
+        dest_dir = self.matters / "Collisions"
+        dest_dir.mkdir(parents=True)
+        # Create base file and simulated timestamp collision
+        f1 = briefly.unique_destination(dest_dir, "doc.txt")
+        self.assertEqual(f1.name, "doc.txt")
+        f1.write_text("v1")
+
+        # Second one gets timestamp
+        f2 = briefly.unique_destination(dest_dir, "doc.txt")
+        self.assertNotEqual(f2.name, "doc.txt")
+        self.assertTrue(f2.name.startswith("doc ("))
+        f2.write_text("v2")
+
+        # Third one with pre-existing f2 name gets counter suffix
+        f3 = briefly.unique_destination(dest_dir, "doc.txt")
+        self.assertNotEqual(f3, f1)
+        self.assertNotEqual(f3, f2)
+        f3.write_text("v3")
+
+        self.assertEqual(f1.read_text(), "v1")
+        self.assertEqual(f2.read_text(), "v2")
+        self.assertEqual(f3.read_text(), "v3")
+
+    def test_classify_non_dict_response(self):
+        (self.matters / "Matter Alpha").mkdir()
+        test_file = self.inbox / "file.txt"
+        test_file.write_text("Some text")
+
+        # Mock Ollama returning a JSON array instead of dict
+        mock_response = {"response": json.dumps(["not", "a", "dict"])}
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_cm = MagicMock()
+            mock_cm.__enter__.return_value.read.return_value = json.dumps(mock_response).encode()
+            mock_url.return_value = mock_cm
+
+            with self.assertRaises(RuntimeError) as ctx:
+                briefly.classify(test_file, "Some text")
+            self.assertIn("unreadable result", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

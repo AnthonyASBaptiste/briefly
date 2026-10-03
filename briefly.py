@@ -9,10 +9,12 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 import zipfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -421,9 +423,19 @@ def watcher():
             scan()
 
 
+def open_browser():
+    time.sleep(0.6)
+    try:
+        webbrowser.open("http://127.0.0.1:8765")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     init_workspace()
     threading.Thread(target=watcher, daemon=True).start()
+    if os.environ.get("BRIEFLY_NO_BROWSER") != "1" and "--no-browser" not in sys.argv:
+        threading.Thread(target=open_browser, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
     print("Briefly is running at http://127.0.0.1:8765 (local only)")
     try:

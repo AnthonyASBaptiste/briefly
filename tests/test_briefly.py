@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -233,6 +234,21 @@ class TestBriefly(unittest.TestCase):
             with patch("subprocess.run", return_value=mock_cancel):
                 self.assertEqual(briefly.pick_folder(), "")
 
+        # 3. macOS osascript path escaping
+        esc_dir = Path(self.test_dir) / 'folder "quotes" and \\backslashes'
+        esc_dir.mkdir(parents=True, exist_ok=True)
+        mock_proc_mac = MagicMock()
+        mock_proc_mac.returncode = 0
+        mock_proc_mac.stdout = "/custom/path/chosen\n"
+        with patch("shutil.which", side_effect=lambda cmd: "/usr/bin/osascript" if cmd == "osascript" else None):
+            with patch("subprocess.run", return_value=mock_proc_mac) as mock_run:
+                chosen = briefly.pick_folder(str(esc_dir))
+                self.assertEqual(chosen, "/custom/path/chosen")
+                cmd_arg = mock_run.call_args[0][0]
+                self.assertEqual(cmd_arg[0], "osascript")
+                self.assertIn(r'\\backslashes', cmd_arg[2])
+                self.assertIn(r'\"quotes\"', cmd_arg[2])
+
     def test_api_exclude_success(self):
         server = briefly.ThreadingHTTPServer(("127.0.0.1", 0), briefly.Handler)
         port = server.server_address[1]
@@ -371,6 +387,31 @@ class TestBriefly(unittest.TestCase):
             self.assertEqual(res["suggestions"][0]["files"], ["contract.txt"])
             self.assertEqual(res["suggestions"][0]["confidence"], 0.92)
             self.assertFalse(res["suggestions"][0]["already_exists"])
+
+    def test_discover_matters_non_numeric_confidence(self):
+        doc = self.inbox / "contract.txt"
+        doc.write_text("Agreement between Acme Corp and Beta LLC.")
+        mock_response = {
+            "response": json.dumps({
+                "matters": [
+                    {
+                        "matter_name": "Acme Corp v Beta LLC",
+                        "doc_ids": [1],
+                        "confidence": "high",
+                        "reason": "Strong evidence"
+                    }
+                ],
+                "unrelated_doc_ids": []
+            })
+        }
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_cm = MagicMock()
+            mock_cm.__enter__.return_value.read.return_value = json.dumps(mock_response).encode()
+            mock_url.return_value = mock_cm
+
+            res = briefly.discover_matters()
+            self.assertEqual(len(res["suggestions"]), 1)
+            self.assertEqual(res["suggestions"][0]["confidence"], 0.9)
 
     def test_discover_matters_matches_existing_library_matter(self):
         (self.matters / "Acme Corp v Beta LLC").mkdir()
@@ -546,6 +587,81 @@ class TestBriefly(unittest.TestCase):
         self.assertGreater(len(inbox_files), 0)
         matter_folders = list(self.matters.iterdir())
         self.assertGreater(len(matter_folders), 0)
+
+    def test_extract_text_docx_decompressed_bomb(self):
+        docx_file = self.inbox / "bomb.docx"
+        with zipfile.ZipFile(docx_file, "w") as zf:
+            zf.writestr("word/document.xml", "<w:document><w:body/></w:document>")
+        mock_info = MagicMock()
+        mock_info.file_size = 60 * 1024 * 1024
+        with patch.object(zipfile.ZipFile, "getinfo", return_value=mock_info):
+            with self.assertRaises(RuntimeError) as ctx:
+                briefly.extract_text(docx_file)
+            self.assertIn("Decompressed DOCX content exceeds safety limit", str(ctx.exception))
+
+    def test_review_cache_avoids_re_inference(self):
+        (self.matters / "Matter Alpha").mkdir()
+        test_file = self.inbox / "review_doc.txt"
+        test_file.write_text("Some text that does not classify cleanly")
+        os.utime(test_file, (time.time() - 100, time.time() - 100))
+
+        with patch("briefly.classify") as mock_classify:
+            mock_classify.return_value = {
+                "matter": None,
+                "document_type": "Correspondence",
+                "confidence": 0.4,
+                "reason": "Unclear"
+            }
+            res1 = briefly.process_file(test_file, bypass_cooldown=False)
+            self.assertEqual(res1["status"], "review")
+            self.assertEqual(mock_classify.call_count, 1)
+
+            res2 = briefly.process_file(test_file, bypass_cooldown=False)
+            self.assertEqual(res2["status"], "review")
+            self.assertEqual(mock_classify.call_count, 1)
+
+    def test_api_host_header_rejection(self):
+        server = briefly.ThreadingHTTPServer(("127.0.0.1", 0), briefly.Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/state",
+                                         headers={"Host": "evil.com"})
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 403)
+            ctx.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_discover_matters_string_doc_ids(self):
+        doc = self.inbox / "contract.txt"
+        doc.write_text("Agreement between Acme Corp and Beta LLC.")
+        mock_response = {
+            "response": json.dumps({
+                "matters": [
+                    {
+                        "matter_name": "Acme Corp v Beta LLC",
+                        "doc_ids": ["1"],
+                        "confidence": 0.95,
+                        "reason": "Dispute contract"
+                    }
+                ],
+                "unrelated_doc_ids": []
+            })
+        }
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_cm = MagicMock()
+            mock_cm.__enter__.return_value.read.return_value = json.dumps(mock_response).encode()
+            mock_url.return_value = mock_cm
+
+            res = briefly.discover_matters()
+            self.assertEqual(len(res["suggestions"]), 1)
+            self.assertEqual(res["suggestions"][0]["matter"], "Acme Corp v Beta LLC")
+            self.assertEqual(res["suggestions"][0]["files"], ["contract.txt"])
+            self.assertEqual(len(res["unrelated_files"]), 0)
 
 
 if __name__ == "__main__":

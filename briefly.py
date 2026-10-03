@@ -93,7 +93,14 @@ def ensure_workspace_settings():
 
 def save_settings():
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(SETTINGS, indent=2))
+    temp_file = CONFIG.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        temp_file.write_text(json.dumps(SETTINGS, indent=2))
+        temp_file.replace(CONFIG)
+    except Exception:
+        if temp_file.exists():
+            temp_file.unlink(missing_ok=True)
+        raise
 
 
 ensure_workspace_settings()
@@ -161,6 +168,9 @@ def extract_text(path: Path) -> str:
             with zipfile.ZipFile(path) as zf:
                 if "word/document.xml" not in zf.namelist():
                     raise RuntimeError("Invalid DOCX (missing document.xml)")
+                info = zf.getinfo("word/document.xml")
+                if info.file_size > MAX_FILE_SIZE:
+                    raise RuntimeError("Decompressed DOCX content exceeds safety limit")
                 data = zf.read("word/document.xml")
             root = ElementTree.fromstring(data)
             text = " ".join(t.text or "" for t in root.iter() if t.tag.endswith("}t")).strip()
@@ -250,6 +260,9 @@ Filename: {path.name}\nDocument excerpt:\n{text[:12000]}'''
             "reason": str(answer.get("reason", ""))[:300]}
 
 
+_PROCESSED_REVIEW_CACHE = {}
+
+
 def process_file(path: Path, bypass_cooldown=False):
     inbox = safe_path(SETTINGS["inbox"])
     try:
@@ -265,9 +278,14 @@ def process_file(path: Path, bypass_cooldown=False):
     if ext in excluded or ext not in allowed:
         return None
     try:
-        if time.time() - path.stat().st_mtime < int(SETTINGS["cooldown_seconds"]) and not bypass_cooldown:
+        st = path.stat()
+        cache_key = (str(path), st.st_mtime, st.st_size, tuple(sorted(matter_folders())))
+        if not bypass_cooldown and cache_key in _PROCESSED_REVIEW_CACHE:
+            return _PROCESSED_REVIEW_CACHE[cache_key]
+
+        if time.time() - st.st_mtime < int(SETTINGS["cooldown_seconds"]) and not bypass_cooldown:
             return None
-        size1 = path.stat().st_size
+        size1 = st.st_size
         time.sleep(.15)
         if path.stat().st_size != size1:
             return None
@@ -275,22 +293,34 @@ def process_file(path: Path, bypass_cooldown=False):
         result = classify(path, text)
         threshold = float(SETTINGS["confidence_threshold"])
         if result["matter"] and result["confidence"] >= threshold:
-            root = safe_path(SETTINGS["library"])
-            matter = (root / result["matter"]).resolve()
-            matter.relative_to(root)
-            destination_dir = (matter / result["document_type"]).resolve()
-            destination_dir.relative_to(matter)
-            destination_dir.mkdir(exist_ok=True)
-            dest = unique_destination(destination_dir, path.name)
-            shutil.move(str(path), str(dest))
-            log_activity(path.name, path, dest, "filed", result["document_type"], result["matter"], result["confidence"], result["reason"])
-            return {"status": "filed", "filename": path.name, "destination": str(dest), **result}
+            with LOCK:
+                if not path.is_file():
+                    return None
+                root = safe_path(SETTINGS["library"])
+                matter = (root / result["matter"]).resolve()
+                matter.relative_to(root)
+                destination_dir = (matter / result["document_type"]).resolve()
+                destination_dir.relative_to(matter)
+                destination_dir.mkdir(exist_ok=True)
+                dest = unique_destination(destination_dir, path.name)
+                shutil.move(str(path), str(dest))
+                log_activity(path.name, path, dest, "filed", result["document_type"], result["matter"], result["confidence"], result["reason"])
+                _PROCESSED_REVIEW_CACHE.pop(cache_key, None)
+                return {"status": "filed", "filename": path.name, "destination": str(dest), **result}
         reason = result["reason"] or ("No existing matter matched" if not result["matter"] else "Below auto-file confidence threshold")
         log_activity(path.name, path, "", "review", result["document_type"], result["matter"] or "", result["confidence"], reason)
-        return {"status": "review", "filename": path.name, "destination": "", **result, "reason": reason}
+        review_res = {"status": "review", "filename": path.name, "destination": "", **result, "reason": reason}
+        _PROCESSED_REVIEW_CACHE[cache_key] = review_res
+        return review_res
     except Exception as e:
         log_activity(path.name, path, "", "review", reason=str(e)[:300])
-        return {"status": "review", "filename": path.name, "destination": "", "reason": str(e)}
+        err_res = {"status": "review", "filename": path.name, "destination": "", "reason": str(e)}
+        try:
+            st = path.stat()
+            _PROCESSED_REVIEW_CACHE[(str(path), st.st_mtime, st.st_size, tuple(sorted(matter_folders())))] = err_res
+        except Exception:
+            pass
+        return err_res
 
 
 def scan(bypass_cooldown=False):
@@ -299,12 +329,11 @@ def scan(bypass_cooldown=False):
     if not matter_folders():
         raise RuntimeError("Your matter library is empty. Run First pass to suggest matter folders, then approve the ones you want.")
     outcomes = []
-    with LOCK:
-        for p in sorted(inbox.iterdir()):
-            if p.is_file():
-                result = process_file(p, bypass_cooldown)
-                if result:
-                    outcomes.append(result)
+    candidates = [p for p in sorted(inbox.iterdir()) if p.is_file()]
+    for p in candidates:
+        result = process_file(p, bypass_cooldown)
+        if result:
+            outcomes.append(result)
     return outcomes
 
 
@@ -417,7 +446,16 @@ Return JSON matching:
         doc_ids = item.get("doc_ids", [])
         if not isinstance(doc_ids, list):
             doc_ids = []
-        valid_files = [id_to_candidate[did]["filename"] for did in doc_ids if did in id_to_candidate]
+        valid_files = []
+        assigned_in_this_matter = []
+        for did in doc_ids:
+            try:
+                did_int = int(did)
+            except (ValueError, TypeError):
+                did_int = did
+            if did_int in id_to_candidate:
+                valid_files.append(id_to_candidate[did_int]["filename"])
+                assigned_in_this_matter.append(did_int)
         if not valid_files:
             continue
 
@@ -428,7 +466,10 @@ Return JSON matching:
             already_exists = True
             final_name = existing_keys[ckey]
 
-        conf = float(item.get("confidence", 0.9))
+        try:
+            conf = float(item.get("confidence", 0.9))
+        except (ValueError, TypeError):
+            conf = 0.9
         conf = max(0.0, min(1.0, conf))
         reason = str(item.get("reason", ""))[:300]
 
@@ -440,13 +481,21 @@ Return JSON matching:
             "reason": reason,
             "already_exists": already_exists
         })
-        all_assigned_ids.update(did for did in doc_ids if did in id_to_candidate)
+        all_assigned_ids.update(assigned_in_this_matter)
 
     unrelated_ids = parsed.get("unrelated_doc_ids", [])
     if not isinstance(unrelated_ids, list):
         unrelated_ids = []
 
-    unrelated_files = [id_to_candidate[did]["filename"] for did in unrelated_ids if did in id_to_candidate]
+    unrelated_files = []
+    for did in unrelated_ids:
+        try:
+            did_int = int(did)
+        except (ValueError, TypeError):
+            did_int = did
+        if did_int in id_to_candidate:
+            unrelated_files.append(id_to_candidate[did_int]["filename"])
+
     for c in candidates:
         if c["id"] not in all_assigned_ids and c["filename"] not in unrelated_files:
             unrelated_files.append(c["filename"])
@@ -465,7 +514,8 @@ def pick_folder(initial=""):
 
     # 1. macOS osascript (native Cocoa Finder folder picker)
     if shutil.which("osascript"):
-        script = f'POSIX path of (choose folder with prompt "Choose a local folder" default location POSIX file "{initial_path}")'
+        clean_initial = str(initial_path).replace("\\", "\\\\").replace('"', '\\"')
+        script = f'POSIX path of (choose folder with prompt "Choose a local folder" default location POSIX file "{clean_initial}")'
         try:
             res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=120)
             if res.returncode == 0 and res.stdout.strip():
@@ -541,7 +591,10 @@ def create_matter_folder(proposed):
     target.relative_to(root)
     if target.exists():
         raise ValueError("That matter folder already exists")
-    target.mkdir()
+    try:
+        target.mkdir()
+    except FileExistsError:
+        raise ValueError("That matter folder already exists")
     log_activity(name, "", target, "matter_created", "", name, 1.0, "Matter folder created after user approval; no files moved")
     return name
 
@@ -567,6 +620,7 @@ def ollama_status():
 
 
 def init_demo():
+    _PROCESSED_REVIEW_CACHE.clear()
     inbox = safe_path(SETTINGS["inbox"])
     library = safe_path(SETTINGS["library"])
     inbox.mkdir(parents=True, exist_ok=True)
@@ -608,6 +662,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def _validate_request(self) -> bool:
+        host = self.headers.get("Host", "").split(":")[0].strip().lower()
+        if host not in ("127.0.0.1", "localhost", ""):
+            self.send_json({"error": "Forbidden: invalid host"}, 403)
+            return False
+        return True
+
     def send_json(self, obj, code=200):
         raw = json.dumps(obj).encode()
         self.send_response(code); self.send_header("Content-Type", "application/json")
@@ -615,6 +676,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(raw)
 
     def do_GET(self):
+        if not self._validate_request():
+            return
         route = urlparse(self.path).path
         if route == "/api/state":
             self.send_json(dashboard_data())
@@ -626,10 +689,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Not found"}, 404)
 
     def do_POST(self):
+        if not self._validate_request():
+            return
+        content_type = self.headers.get("Content-Type", "")
+        content_len = int(self.headers.get("Content-Length", "0") or 0)
+        if content_len > 0 and "application/json" not in content_type:
+            self.send_json({"error": "Content-Type must be application/json"}, 415)
+            return
         global SETTINGS
         route = urlparse(self.path).path
         try:
-            data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0")) or 0) or b"{}")
+            data = json.loads(self.rfile.read(content_len) or b"{}")
             if route == "/api/settings":
                 with LOCK:
                     proposed = {**SETTINGS, **data}
@@ -657,8 +727,9 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/discover":
                 self.send_json(discover_matters())
             elif route == "/api/create-matter":
-                name = create_matter_folder(data.get("name", ""))
-                self.send_json({"ok": True, "name": name, "state": dashboard_data()})
+                with LOCK:
+                    name = create_matter_folder(data.get("name", ""))
+                    self.send_json({"ok": True, "name": name, "state": dashboard_data()})
             elif route == "/api/scan":
                 self.send_json({"results": scan()})
             elif route == "/api/demo":

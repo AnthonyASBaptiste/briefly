@@ -33,5 +33,5 @@ Briefly is designed with an editorial, trustworthy, and calm aesthetic tailored 
 ## Spacing & Elevation
 - Base radius: `9px` on buttons, `13px` on cards/panels, `17px` on hero banner.
 - Shadow: `0 4px 18px rgba(16,42,34,0.06), 0 1px 3px rgba(16,42,34,0.04)`
-- Interactive touch targets: minimum `40px` height on all buttons and inputs.
+- Interactive touch targets: minimum `44px` height on all buttons, select menus, and form inputs (WCAG 2.5.5), with compact inline controls (e.g. `.btn-xs`) at `38px`.
 - Keyboard navigation: visible 2px outline with 2px offset (`outline: 2px solid var(--green)`).

@@ -86,7 +86,7 @@ def ensure_workspace_settings():
     """Ensure inbox, library, and unrelated_folder paths are configured and valid."""
     for key, default in (("inbox", WORK / "inbox"), ("library", WORK / "matters"), ("unrelated_folder", Path.home() / "Documents")):
         value = str(SETTINGS.get(key, "")).strip()
-        if not value:
+        if not value or value.startswith("/tmp/"):
             SETTINGS[key] = str(default.resolve())
     save_settings()
 
@@ -105,12 +105,12 @@ def db():
     con = sqlite3.connect(DB, timeout=10)
     con.row_factory = sqlite3.Row
     try:
+        con.execute("""CREATE TABLE IF NOT EXISTS activity (
+          id INTEGER PRIMARY KEY, created_at TEXT, filename TEXT, source TEXT,
+          destination TEXT, status TEXT, doc_type TEXT, matter TEXT,
+          confidence REAL, reason TEXT)""")
         with con:
-            con.execute("""CREATE TABLE IF NOT EXISTS activity (
-              id INTEGER PRIMARY KEY, created_at TEXT, filename TEXT, source TEXT,
-              destination TEXT, status TEXT, doc_type TEXT, matter TEXT,
-              confidence REAL, reason TEXT)""")
-        yield con
+            yield con
     finally:
         con.close()
 
@@ -571,6 +571,8 @@ def init_demo():
     library = safe_path(SETTINGS["library"])
     inbox.mkdir(parents=True, exist_ok=True)
     library.mkdir(parents=True, exist_ok=True)
+    with db() as con:
+        con.execute("DELETE FROM activity")
     try:
         if str(APP) not in sys.path:
             sys.path.insert(0, str(APP))

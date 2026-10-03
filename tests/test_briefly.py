@@ -25,11 +25,17 @@ class TestBriefly(unittest.TestCase):
         self.matters.mkdir(parents=True)
         self.unrelated.mkdir(parents=True)
         self.original_settings = dict(briefly.SETTINGS)
+        self.original_db = briefly.DB
+        self.original_config = briefly.CONFIG
+        briefly.DB = Path(self.test_dir) / "test.sqlite3"
+        briefly.CONFIG = Path(self.test_dir) / "test_settings.json"
         briefly.SETTINGS["inbox"] = str(self.inbox)
         briefly.SETTINGS["library"] = str(self.matters)
         briefly.SETTINGS["unrelated_folder"] = str(self.unrelated)
 
     def tearDown(self):
+        briefly.DB = self.original_db
+        briefly.CONFIG = self.original_config
         briefly.SETTINGS.clear()
         briefly.SETTINGS.update(self.original_settings)
         shutil.rmtree(self.test_dir, ignore_errors=True)

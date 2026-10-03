@@ -37,6 +37,20 @@ DEFAULTS = {
 LOCK = threading.RLock()
 CONFIG = APP / "workspace" / "settings.json"
 DB = APP / "workspace" / "briefly.sqlite3"
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB safety cap
+
+
+def canonical_matter_key(name: str) -> str:
+    """Normalize a matter name to a canonical comparison key.
+    Handles 'Smith v. Jones', 'Smith_vs_Jones', 'Smith versus Jones', 'Smith v Jones'
+    """
+    if not name:
+        return ""
+    s = str(name).lower().strip()
+    s = re.sub(r"[_\-]+", " ", s)
+    s = re.sub(r"\b(vs\.?|versus|v)\b|\bv\.", " v ", s)
+    s = re.sub(r"[^\w\s]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def is_local_url(url: str) -> bool:
@@ -135,31 +149,53 @@ def matter_folders():
 
 
 def extract_text(path: Path) -> str:
+    if path.stat().st_size > MAX_FILE_SIZE:
+        raise RuntimeError("File exceeds 50 MB safety limit; left for manual review")
     ext = path.suffix.lower()
+    if ext == ".zip":
+        raise RuntimeError("Archive bundle (.zip); please extract contents into inbox")
     if ext in (".txt", ".md"):
         return path.read_text(errors="replace")[:24000]
     if ext == ".docx":
-        with zipfile.ZipFile(path) as zf:
-            data = zf.read("word/document.xml")
-        root = ElementTree.fromstring(data)
-        return " ".join(t.text or "" for t in root.iter() if t.tag.endswith("}t"))[:24000]
+        try:
+            with zipfile.ZipFile(path) as zf:
+                if "word/document.xml" not in zf.namelist():
+                    raise RuntimeError("Invalid DOCX (missing document.xml)")
+                data = zf.read("word/document.xml")
+            root = ElementTree.fromstring(data)
+            text = " ".join(t.text or "" for t in root.iter() if t.tag.endswith("}t")).strip()
+            if not text:
+                raise RuntimeError("DOCX contains no extractable text; left for manual review")
+            return text[:24000]
+        except zipfile.BadZipFile:
+            raise RuntimeError("Corrupted or encrypted DOCX file")
+        except ElementTree.ParseError:
+            raise RuntimeError("Malformed XML in DOCX file")
     if ext == ".pdf":
         pdftotext = shutil.which("pdftotext")
         if not pdftotext:
             raise RuntimeError("PDF text extraction needs pdftotext. Install Poppler, or use DOCX/TXT for this demo.")
-        proc = subprocess.run([pdftotext, "-f", "1", "-l", "8", "-layout", str(path), "-"],
-                              capture_output=True, text=True, timeout=20)
+        try:
+            proc = subprocess.run([pdftotext, "-f", "1", "-l", "8", "-layout", str(path), "-"],
+                                  capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("PDF extraction timed out (>15s); left for manual review")
         if proc.returncode:
-            raise RuntimeError("Could not read this PDF")
+            err = (proc.stderr or "").lower()
+            if "password" in err or "encrypted" in err:
+                raise RuntimeError("Password-protected PDF; left for manual review")
+            raise RuntimeError("Could not read PDF (damaged or unsupported format)")
         text = proc.stdout.strip()
-        if not text:
-            raise RuntimeError("This PDF appears to be scanned; OCR is not included in this MVP")
+        alpha_count = sum(c.isalnum() for c in text)
+        if alpha_count < 40:
+            raise RuntimeError("This PDF appears to be a scanned image without OCR text; left for manual review")
         return text[:24000]
     raise RuntimeError("Unsupported file type")
 
 
 def classify(path: Path, text: str, allow_unlisted=False):
     matters = matter_folders()
+    canonical_map = {canonical_matter_key(m): m for m in matters}
     if not matters and not allow_unlisted:
         raise RuntimeError("Add at least one matter folder inside the configured library")
     instruction = (f"Identify a likely named legal matter from the document. Suggest a concise, reusable folder name "
@@ -193,10 +229,18 @@ Filename: {path.name}\nDocument excerpt:\n{text[:12000]}'''
     matter = answer.get("matter")
     if str(matter).strip().lower() in ("null", "none", ""):
         matter = None
-    if not allow_unlisted and matter not in matters:
-        matter = None
-    if allow_unlisted and matter is not None:
-        matter = re.sub(r"[/\\]+", " ", str(matter)).strip()[:100] or None
+
+    if matter is not None:
+        ckey = canonical_matter_key(str(matter))
+        if ckey in canonical_map:
+            # Reconcile to exact existing directory name on disk
+            matter = canonical_map[ckey]
+        elif not allow_unlisted:
+            # Closed-world constraint: discard any invented/unlisted name
+            matter = None
+        else:
+            matter = re.sub(r"[/\\]+", " ", str(matter)).strip()[:100] or None
+
     dtype = re.sub(r"[^\w -]", "", str(answer.get("document_type", "Other"))).strip()[:48] or "Other"
     try:
         confidence = max(0.0, min(1.0, float(answer.get("confidence", 0))))
@@ -270,6 +314,7 @@ def discover_matters():
     inbox.mkdir(parents=True, exist_ok=True)
     allowed = {x.lower() if x.startswith(".") else "." + x.lower() for x in SETTINGS["extensions"]}
     excluded = {x.lower() if x.startswith(".") else "." + x.lower() for x in SETTINGS["excluded_extensions"]}
+    existing_keys = {canonical_matter_key(m) for m in matter_folders()}
     suggestions, skipped_cooldown = [], []
     with LOCK:
         for path in sorted(inbox.iterdir()):
@@ -289,6 +334,8 @@ def discover_matters():
             try:
                 text = extract_text(path)
                 result = classify(path, text, allow_unlisted=True)
+                if result.get("matter") and canonical_matter_key(result["matter"]) in existing_keys:
+                    result["already_exists"] = True
                 suggestions.append({"filename": path.name, "source": str(path), **result})
             except Exception as e:
                 suggestions.append({"filename": path.name, "source": str(path), "matter": None,
@@ -367,6 +414,11 @@ def create_matter_folder(proposed):
     name = re.sub(r"[^\w &(),.\'-]", "", name).strip(" .")[:100]
     if not name or name in (".", ".."):
         raise ValueError("Enter a valid matter folder name")
+    proposed_key = canonical_matter_key(name)
+    existing = matter_folders()
+    for m in existing:
+        if canonical_matter_key(m) == proposed_key:
+            raise ValueError(f"A matter folder with this name already exists ('{m}')")
     root = safe_path(SETTINGS["library"])
     root.mkdir(parents=True, exist_ok=True)
     target = (root / name).resolve()

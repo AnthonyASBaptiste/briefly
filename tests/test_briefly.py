@@ -372,5 +372,110 @@ class TestBriefly(unittest.TestCase):
             server.server_close()
 
 
+    def test_canonical_matter_key(self):
+        self.assertEqual(briefly.canonical_matter_key("Smith v. Jones"), "smith v jones")
+        self.assertEqual(briefly.canonical_matter_key("Smith_vs_Jones"), "smith v jones")
+        self.assertEqual(briefly.canonical_matter_key("Smith vs. Jones"), "smith v jones")
+        self.assertEqual(briefly.canonical_matter_key("Smith versus Jones"), "smith v jones")
+        self.assertEqual(briefly.canonical_matter_key("Smith v Jones"), "smith v jones")
+        self.assertEqual(briefly.canonical_matter_key("Estate of Joseph Ramdial."), "estate of joseph ramdial")
+
+    def test_classify_canonical_reconciliation(self):
+        (self.matters / "Garcia v Northstar Ltd").mkdir()
+        test_file = self.inbox / "order.txt"
+        test_file.write_text("Court order content")
+        # Model returns punctuation variation "Garcia v. Northstar Ltd"
+        mock_response = {
+            "response": json.dumps({
+                "matter": "Garcia v. Northstar Ltd",
+                "document_type": "Court Orders",
+                "confidence": 0.95,
+                "reason": "Clear order"
+            })
+        }
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_cm = MagicMock()
+            mock_cm.__enter__.return_value.read.return_value = json.dumps(mock_response).encode()
+            mock_url.return_value = mock_cm
+
+            res = briefly.classify(test_file, "Court order content")
+            # Should reconcile to the exact existing directory name!
+            self.assertEqual(res["matter"], "Garcia v Northstar Ltd")
+
+    def test_classify_closed_world_hallucination_stripped(self):
+        (self.matters / "Garcia v Northstar Ltd").mkdir()
+        test_file = self.inbox / "doc.txt"
+        test_file.write_text("Some text")
+        # Model returns an invented matter not in the library
+        mock_response = {
+            "response": json.dumps({
+                "matter": "Completely Hallucinated Matter",
+                "document_type": "Other",
+                "confidence": 0.9,
+                "reason": "Invented name"
+            })
+        }
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_cm = MagicMock()
+            mock_cm.__enter__.return_value.read.return_value = json.dumps(mock_response).encode()
+            mock_url.return_value = mock_cm
+
+            res = briefly.classify(test_file, "Some text", allow_unlisted=False)
+            self.assertIsNone(res["matter"])
+
+    def test_create_matter_folder_canonical_duplicate_rejected(self):
+        (self.matters / "Smith v Jones").mkdir()
+        with self.assertRaises(ValueError) as ctx:
+            briefly.create_matter_folder("Smith v. Jones")
+        self.assertIn("already exists", str(ctx.exception))
+
+    def test_extract_text_scanned_pdf(self):
+        test_pdf = self.inbox / "scanned.pdf"
+        test_pdf.write_bytes(b"%PDF-1.4 dummy")
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "   \n\n  12   \n "  # Fewer than 40 alphanumeric characters
+        with patch("shutil.which", return_value="/usr/bin/pdftotext"):
+            with patch("subprocess.run", return_value=mock_proc):
+                with self.assertRaises(RuntimeError) as ctx:
+                    briefly.extract_text(test_pdf)
+                self.assertIn("scanned image without OCR text", str(ctx.exception))
+
+    def test_extract_text_password_protected_pdf(self):
+        test_pdf = self.inbox / "locked.pdf"
+        test_pdf.write_bytes(b"%PDF-1.4 dummy")
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.stderr = "Command Line Error: Incorrect password"
+        with patch("shutil.which", return_value="/usr/bin/pdftotext"):
+            with patch("subprocess.run", return_value=mock_proc):
+                with self.assertRaises(RuntimeError) as ctx:
+                    briefly.extract_text(test_pdf)
+                self.assertIn("Password-protected PDF", str(ctx.exception))
+
+    def test_extract_text_corrupt_docx(self):
+        test_docx = self.inbox / "bad.docx"
+        test_docx.write_text("Not a real zip archive")
+        with self.assertRaises(RuntimeError) as ctx:
+            briefly.extract_text(test_docx)
+        self.assertIn("Corrupted or encrypted DOCX", str(ctx.exception))
+
+    def test_extract_text_oversized_file(self):
+        test_file = self.inbox / "huge.txt"
+        test_file.write_text("Short text")
+        with patch.object(Path, "stat") as mock_stat:
+            mock_stat.return_value.st_size = 55 * 1024 * 1024
+            with self.assertRaises(RuntimeError) as ctx:
+                briefly.extract_text(test_file)
+            self.assertIn("exceeds 50 MB safety limit", str(ctx.exception))
+
+    def test_extract_text_zip_archive(self):
+        test_zip = self.inbox / "bundle.zip"
+        test_zip.write_bytes(b"PK\x03\x04")
+        with self.assertRaises(RuntimeError) as ctx:
+            briefly.extract_text(test_zip)
+        self.assertIn("Archive bundle (.zip)", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

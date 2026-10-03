@@ -333,5 +333,44 @@ class TestBriefly(unittest.TestCase):
             server.server_close()
 
 
+    def test_discover_matters_empty_inbox(self):
+        res = briefly.discover_matters()
+        self.assertEqual(res["suggestions"], [])
+        self.assertEqual(res["skipped_cooldown"], [])
+
+    def test_discover_matters_with_files(self):
+        doc = self.inbox / "contract.txt"
+        doc.write_text("Agreement between Acme Corp and Beta LLC.")
+        mock_result = {
+            "matter": "Acme Corp Merger",
+            "document_type": "Agreement",
+            "confidence": 0.92,
+            "reason": "Strong evidence of merger agreement"
+        }
+        with patch("briefly.classify", return_value=mock_result):
+            res = briefly.discover_matters()
+            self.assertEqual(len(res["suggestions"]), 1)
+            self.assertEqual(res["suggestions"][0]["matter"], "Acme Corp Merger")
+            self.assertEqual(res["suggestions"][0]["filename"], "contract.txt")
+            self.assertEqual(res["suggestions"][0]["confidence"], 0.92)
+
+    def test_api_discover(self):
+        server = briefly.ThreadingHTTPServer(("127.0.0.1", 0), briefly.Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/discover", data=b"{}",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read())
+                self.assertIn("suggestions", data)
+                self.assertIn("skipped_cooldown", data)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

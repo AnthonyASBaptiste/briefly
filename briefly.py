@@ -156,6 +156,8 @@ Filename: {path.name}\nDocument excerpt:\n{text[:12000]}'''
     except (ValueError, KeyError) as e:
         raise RuntimeError("The model returned an unreadable result; file left untouched") from e
     matter = answer.get("matter")
+    if str(matter).strip().lower() in ("null", "none", ""):
+        matter = None
     if not allow_unlisted and matter not in matters:
         matter = None
     if allow_unlisted and matter is not None:

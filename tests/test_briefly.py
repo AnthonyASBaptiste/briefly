@@ -690,6 +690,25 @@ class TestBriefly(unittest.TestCase):
             self.assertEqual(res["suggestions"][0]["files"], ["contract.txt"])
             self.assertEqual(len(res["unrelated_files"]), 0)
 
+    def test_favicon_endpoints(self):
+        server = briefly.ThreadingHTTPServer(("127.0.0.1", 0), briefly.Handler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.svg") as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.headers.get("Content-Type"), "image/svg+xml")
+                self.assertIn(b"<svg", resp.read())
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico") as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.headers.get("Content-Type"), "image/x-icon")
+                self.assertGreater(len(resp.read()), 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
+

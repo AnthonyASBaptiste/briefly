@@ -685,6 +685,24 @@ class Handler(BaseHTTPRequestHandler):
             raw = (APP / "static" / "index.html").read_bytes()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+        elif route in ("/favicon.svg", "/static/favicon.svg"):
+            fav = APP / "static" / "favicon.svg"
+            if fav.exists():
+                raw = fav.read_bytes()
+                self.send_response(200); self.send_header("Content-Type", "image/svg+xml")
+                self.send_header("Content-Length", str(len(raw))); self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers(); self.wfile.write(raw)
+            else:
+                self.send_json({"error": "Not found"}, 404)
+        elif route in ("/favicon.ico", "/static/favicon.ico"):
+            fav = APP / "static" / "favicon.ico"
+            if fav.exists():
+                raw = fav.read_bytes()
+                self.send_response(200); self.send_header("Content-Type", "image/x-icon")
+                self.send_header("Content-Length", str(len(raw))); self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers(); self.wfile.write(raw)
+            else:
+                self.send_json({"error": "Not found"}, 404)
         else:
             self.send_json({"error": "Not found"}, 404)
 

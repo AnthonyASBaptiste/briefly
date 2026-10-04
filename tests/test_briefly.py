@@ -30,6 +30,8 @@ class TestBriefly(unittest.TestCase):
         self.original_config = briefly.CONFIG
         briefly.DB = Path(self.test_dir) / "test.sqlite3"
         briefly.CONFIG = Path(self.test_dir) / "test_settings.json"
+        briefly.SETTINGS.clear()
+        briefly.SETTINGS.update(briefly.DEFAULTS)
         briefly.SETTINGS["inbox"] = str(self.inbox)
         briefly.SETTINGS["library"] = str(self.matters)
         briefly.SETTINGS["unrelated_folder"] = str(self.unrelated)

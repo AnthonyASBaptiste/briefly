@@ -615,6 +615,13 @@ class TestBriefly(unittest.TestCase):
         matter_folders = list(self.matters.iterdir())
         self.assertGreater(len(matter_folders), 0)
 
+    def test_init_demo_without_seed(self):
+        briefly.init_demo(seed_matters_flag=False)
+        inbox_files = list(self.inbox.iterdir())
+        self.assertGreater(len(inbox_files), 0)
+        matter_folders = list(self.matters.iterdir())
+        self.assertEqual(len(matter_folders), 0)
+
     def test_extract_text_docx_decompressed_bomb(self):
         docx_file = self.inbox / "bomb.docx"
         with zipfile.ZipFile(docx_file, "w") as zf:

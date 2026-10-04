@@ -619,7 +619,7 @@ def ollama_status():
         return {"online": False, "models": [], "selected_available": False}
 
 
-def init_demo():
+def init_demo(seed_matters_flag=True):
     _PROCESSED_REVIEW_CACHE.clear()
     inbox = safe_path(SETTINGS["inbox"])
     library = safe_path(SETTINGS["library"])
@@ -627,27 +627,29 @@ def init_demo():
     library.mkdir(parents=True, exist_ok=True)
     with db() as con:
         con.execute("DELETE FROM activity")
+    for item in inbox.iterdir():
+        if item.is_file():
+            try:
+                item.unlink()
+            except OSError:
+                pass
+    if not seed_matters_flag:
+        for item in library.iterdir():
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
     try:
         if str(APP) not in sys.path:
             sys.path.insert(0, str(APP))
         from scripts.generate_demo_files import generate_all_files, seed_matters
-        seed_matters(library)
+        if seed_matters_flag:
+            seed_matters(library)
         generate_all_files(inbox)
         return
     except Exception:
         pass
-    (library / "Garcia v Northstar Ltd").mkdir(exist_ok=True)
-    (library / "Ramdial Estate").mkdir(exist_ok=True)
-    samples = {
-      "WhatsApp Document.txt": "IN THE HIGH COURT OF JUSTICE\nClaim No. CV2026-01234\nBETWEEN: MARIA GARCIA Claimant and NORTHSTAR LIMITED Defendant\nORDER: The defendant shall file its defence within 28 days.",
-      "scan_0041.txt": "Dear Counsel, Re: Estate of Joseph Ramdial. Please find enclosed the valuation report for the residential property at 18 Cedar Grove. Kindly advise on next steps.",
-      "download (3).txt": "Receipt for office chair. Total: $1,299.00. Thank you for your purchase.",
-    }
-    for name, content in samples.items():
-        p = inbox / name
-        if not p.exists():
-            p.write_text(content)
-            os.utime(p, (time.time() - 120, time.time() - 120))
+    if seed_matters_flag:
+        (library / "Sterling v Gopaul & Colfire").mkdir(exist_ok=True)
+        (library / "Estate of Helena Blackwood").mkdir(exist_ok=True)
 
 
 def init_workspace():
@@ -751,7 +753,9 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/scan":
                 self.send_json({"results": scan()})
             elif route == "/api/demo":
-                init_demo(); self.send_json({"ok": True, "state": dashboard_data()})
+                seed = bool(data.get("seed", False))
+                init_demo(seed_matters_flag=seed)
+                self.send_json({"ok": True, "state": dashboard_data()})
             elif route == "/api/approve":
                 with LOCK:
                     inbox = safe_path(SETTINGS["inbox"]); root = safe_path(SETTINGS["library"])
